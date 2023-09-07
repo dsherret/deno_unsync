@@ -1,7 +1,6 @@
 use std::cell::UnsafeCell;
 use std::collections::VecDeque;
 use std::future::Future;
-use std::marker::PhantomData;
 use std::ops::Deref;
 use std::ops::DerefMut;
 use std::pin::Pin;
@@ -9,8 +8,6 @@ use std::rc::Rc;
 use std::task::Context;
 use std::task::Poll;
 use std::task::Waker;
-
-use crate::Flag;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BorrowKind {
@@ -115,15 +112,16 @@ impl State {
               }
               WakerState::Waiting(waker) => {
                 self.acquire(pending.kind);
-                waker.take().unwrap().wake();
+                let waker = waker.take().unwrap();
                 pending.waker = WakerState::Ready(state.clone());
                 found_pending = true;
+                waker.wake();
               }
               WakerState::Ready(_) | WakerState::Complete => {
                 unreachable!();
               }
             }
-            if pending.kind.is_write() && found_pending {
+            if pending.kind.is_write() {
               break; // found a writer, exit
             }
           } else if pending.kind.is_write() {

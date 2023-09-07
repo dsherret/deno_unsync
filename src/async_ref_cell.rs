@@ -100,19 +100,17 @@ impl<T> AsyncRefCell<T> {
       let state = &mut *self.state.get();
       !state.try_acquire(true)
     };
-    let state = if should_await {
+    if should_await {
       let future = AcquireFuture {
-        is_reader: false,
-        state: Some(self.state.clone()),
+        cell: self,
+        is_reader: true,
         drop_flag: Default::default(),
       };
       future.await
-    } else {
-      self.state.clone()
-    };
+    }
 
     AsyncRefCellBorrow {
-      state,
+      state: self.state.clone(),
       value: self.inner.get(),
       _phantom: PhantomData::default(),
     }
@@ -123,32 +121,30 @@ impl<T> AsyncRefCell<T> {
       let state = &mut *self.state.get();
       !state.try_acquire(false)
     };
-    let state = if should_await {
+    if should_await {
       let future = AcquireFuture {
+        cell: self,
         is_reader: false,
-        state: Some(self.state.clone()),
         drop_flag: Default::default(),
       };
       future.await
-    } else {
-      self.state.clone()
-    };
+    }
 
     AsyncRefCellBorrowMut {
-      state,
+      state: self.state.clone(),
       value: self.inner.get(),
       _phantom: PhantomData::default(),
     }
   }
 }
 
-struct AcquireFuture {
+struct AcquireFuture<'a, T> {
+  cell: &'a AsyncRefCell<T>,
   is_reader: bool,
-  state: Option<Rc<UnsafeCell<State>>>,
   drop_flag: Option<Rc<Flag>>,
 }
 
-impl Drop for AcquireFuture {
+impl<'a, T> Drop for AcquireFuture<'a, T> {
   fn drop(&mut self) {
     if let Some(flag) = &self.drop_flag {
       flag.raise();
@@ -156,15 +152,15 @@ impl Drop for AcquireFuture {
   }
 }
 
-impl Future for AcquireFuture {
-  type Output = Rc<UnsafeCell<State>>;
+impl<'a, T> Future for AcquireFuture<'a, T> {
+  type Output = ();
 
   fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
     unsafe {
-      let state = &mut *self.state.as_ref().unwrap().get();
+      let state = &mut *self.cell.state.get();
 
       if state.try_acquire(self.is_reader) {
-        Poll::Ready(self.state.take().unwrap())
+        Poll::Ready(())
       } else {
         let drop_flag = self.drop_flag.get_or_insert_with(Default::default).clone();
         state.pending.push_back(PendingWaker {

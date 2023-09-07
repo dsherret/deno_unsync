@@ -111,19 +111,21 @@ impl<T> AsyncRefCell<T> {
 struct AcquireFuture {
   is_reader: bool,
   state: Rc<UnsafeCell<State>>,
-  drop_flag: Rc<Flag>,
+  drop_flag: Option<Rc<Flag>>,
 }
 
 impl Drop for AcquireFuture {
   fn drop(&mut self) {
-    self.drop_flag.raise();
+    if let Some(flag) = &self.drop_flag {
+      flag.raise();
+    }
   }
 }
 
 impl Future for AcquireFuture {
   type Output = ();
 
-  fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+  fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
     unsafe {
       let state = &mut *self.state.get();
 
@@ -131,10 +133,11 @@ impl Future for AcquireFuture {
         || self.is_reader && !state.pending.is_empty()
         || !self.is_reader && state.reader_count > 0
       {
+        let drop_flag = self.drop_flag.get_or_insert_with(Default::default).clone();
         state.pending.push_back(PendingWaker {
           is_reader: self.is_reader,
           waker: cx.waker().clone(),
-          future_dropped: self.drop_flag.clone(),
+          future_dropped: drop_flag,
         });
         Poll::Pending
       } else {

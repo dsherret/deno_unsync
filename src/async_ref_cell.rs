@@ -1,3 +1,4 @@
+use std::borrow::BorrowMut;
 use std::cell::UnsafeCell;
 use std::collections::VecDeque;
 use std::future::Future;
@@ -27,6 +28,23 @@ struct State {
 }
 
 impl State {
+  pub fn try_acquire(&mut self, is_reader: bool) -> bool {
+    if self.is_writing
+      || is_reader && !self.pending.is_empty()
+      || !is_reader && self.reader_count > 0
+    {
+      false
+    } else {
+      if is_reader {
+        self.reader_count += 1;
+      } else {
+        self.is_writing = true;
+      }
+
+      true
+    }
+  }
+
   pub fn wake_pending(&mut self) {
     let mut found_pending = Vec::new();
     while let Some(pending) = self.pending.pop_front() {
@@ -78,30 +96,46 @@ impl<T> AsyncRefCell<T> {
   }
 
   pub async fn borrow(&self) -> AsyncRefCellBorrow<T> {
-    AcquireFuture {
-      is_reader: true,
-      state: self.state.clone(),
-      drop_flag: Default::default(),
-    }
-    .await;
+    let should_await = unsafe {
+      let state = &mut *self.state.get();
+      !state.try_acquire(true)
+    };
+    let state = if should_await {
+      let future = AcquireFuture {
+        is_reader: false,
+        state: Some(self.state.clone()),
+        drop_flag: Default::default(),
+      };
+      future.await
+    } else {
+      self.state.clone()
+    };
 
     AsyncRefCellBorrow {
-      state: self.state.clone(),
+      state,
       value: self.inner.get(),
       _phantom: PhantomData::default(),
     }
   }
 
   pub async fn borrow_mut(&self) -> AsyncRefCellBorrowMut<T> {
-    AcquireFuture {
-      is_reader: false,
-      state: self.state.clone(),
-      drop_flag: Default::default(),
-    }
-    .await;
+    let should_await = unsafe {
+      let state = &mut *self.state.get();
+      !state.try_acquire(false)
+    };
+    let state = if should_await {
+      let future = AcquireFuture {
+        is_reader: false,
+        state: Some(self.state.clone()),
+        drop_flag: Default::default(),
+      };
+      future.await
+    } else {
+      self.state.clone()
+    };
 
     AsyncRefCellBorrowMut {
-      state: self.state.clone(),
+      state,
       value: self.inner.get(),
       _phantom: PhantomData::default(),
     }
@@ -110,7 +144,7 @@ impl<T> AsyncRefCell<T> {
 
 struct AcquireFuture {
   is_reader: bool,
-  state: Rc<UnsafeCell<State>>,
+  state: Option<Rc<UnsafeCell<State>>>,
   drop_flag: Option<Rc<Flag>>,
 }
 
@@ -123,16 +157,15 @@ impl Drop for AcquireFuture {
 }
 
 impl Future for AcquireFuture {
-  type Output = ();
+  type Output = Rc<UnsafeCell<State>>;
 
   fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
     unsafe {
-      let state = &mut *self.state.get();
+      let state = &mut *self.state.as_ref().unwrap().get();
 
-      if state.is_writing
-        || self.is_reader && !state.pending.is_empty()
-        || !self.is_reader && state.reader_count > 0
-      {
+      if state.try_acquire(self.is_reader) {
+        Poll::Ready(self.state.take().unwrap())
+      } else {
         let drop_flag = self.drop_flag.get_or_insert_with(Default::default).clone();
         state.pending.push_back(PendingWaker {
           is_reader: self.is_reader,
@@ -140,14 +173,6 @@ impl Future for AcquireFuture {
           future_dropped: drop_flag,
         });
         Poll::Pending
-      } else {
-        if self.is_reader {
-          state.reader_count += 1;
-        } else {
-          state.is_writing = true;
-        }
-
-        Poll::Ready(())
       }
     }
   }

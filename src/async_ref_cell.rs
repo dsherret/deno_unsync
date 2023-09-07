@@ -29,21 +29,41 @@ impl BorrowKind {
 }
 
 #[derive(Debug)]
+enum WakerState {
+  Pending,
+  Waiting(Option<Waker>),
+  Ready(Rc<UnsafeCell<State>>),
+  Complete,
+}
+
+#[derive(Debug)]
 struct PendingWaker {
   kind: BorrowKind,
-  waker: Waker,
-  future_dropped: Rc<Flag>,
+  waker: WakerState,
+  future_dropped: bool,
+}
+
+impl Drop for PendingWaker {
+  fn drop(&mut self) {
+    if let WakerState::Ready(state) = &self.waker {
+      // the future never got woken up, so release the acquired borrow
+      unsafe {
+        (*state.get()).release(self.kind, &state);
+      }
+    }
+  }
 }
 
 #[derive(Debug, Default)]
 struct State {
-  pending: VecDeque<PendingWaker>,
+  pending: VecDeque<Rc<UnsafeCell<PendingWaker>>>,
   is_writing: bool,
   reader_count: usize,
 }
 
 impl State {
   pub fn try_acquire_sync(&mut self, kind: BorrowKind) -> bool {
+    // don't allow cutting in line if there are pending borrows
     self.pending.is_empty() && self.try_acquire(kind)
   }
 
@@ -54,35 +74,69 @@ impl State {
     {
       false
     } else {
-      if kind.is_read() {
-        self.reader_count += 1;
-      } else {
-        self.is_writing = true;
-      }
-
+      self.acquire(kind);
       true
     }
   }
 
-  pub fn wake_pending(&mut self) {
-    let mut found_pending = Vec::new();
-    while let Some(pending) = self.pending.pop_front() {
-      if !pending.future_dropped.is_raised() {
-        if pending.kind.is_read() {
-          found_pending.push(pending);
-        } else if found_pending.is_empty() {
-          found_pending.push(pending);
-          break; // found a writer, exit
-        } else {
-          // there were already pending readers, store back this writer
-          self.pending.push_front(pending);
-          break;
+  fn acquire(&mut self, kind: BorrowKind) {
+    if kind.is_read() {
+      self.reader_count += 1;
+    } else {
+      self.is_writing = true;
+    }
+  }
+
+  pub fn release(&mut self, kind: BorrowKind, state: &Rc<UnsafeCell<State>>) {
+    if kind.is_read() {
+      self.reader_count -= 1;
+
+      if self.reader_count == 0 {
+        self.wake_pending(state);
+      }
+    } else {
+      self.is_writing = false;
+      self.wake_pending(state);
+    }
+  }
+
+  fn wake_pending(&mut self, state: &Rc<UnsafeCell<State>>) {
+    let mut found_pending = false;
+    while let Some(pending_cell) = self.pending.pop_front() {
+      unsafe {
+        let pending = &mut *pending_cell.get();
+        if !pending.future_dropped {
+          if pending.kind.is_read() || !found_pending {
+            match &mut pending.waker {
+              WakerState::Complete => {
+                // ignore
+              }
+              WakerState::Pending => {
+                self.acquire(pending.kind);
+                pending.waker = WakerState::Ready(state.clone());
+                found_pending = true;
+              }
+              WakerState::Ready(_) => {
+                unreachable!();
+              }
+              WakerState::Waiting(waker) => {
+                self.acquire(pending.kind);
+                waker.take().unwrap().wake();
+                pending.waker = WakerState::Ready(state.clone());
+                found_pending = true;
+              }
+            }
+            if pending.kind.is_write() && found_pending {
+              break; // found a writer, exit
+            }
+          } else if pending.kind.is_write() {
+            debug_assert!(found_pending);
+            // there were already pending readers, store back this writer
+            self.pending.push_front(pending_cell);
+            break;
+          }
         }
       }
-    }
-
-    for pending in found_pending {
-      pending.waker.wake();
     }
   }
 }
@@ -114,9 +168,23 @@ impl<T> AsyncRefCell<T> {
   }
 
   pub fn borrow(&self) -> impl Future<Output = AsyncRefCellBorrow<T>> {
+    let maybe_borrow = self.try_borrow();
     AcquireBorrowFuture {
       cell: self,
-      drop_flag: Default::default(),
+      borrow_or_pending_item: match maybe_borrow {
+        Some(borrow) => BorrowOrPendingWaker::Borrow(Some(borrow)),
+        None => {
+          let waker = Rc::new(UnsafeCell::new(PendingWaker {
+            kind: BorrowKind::Read,
+            waker: WakerState::Pending,
+            future_dropped: false,
+          }));
+          unsafe {
+            (*self.state.get()).pending.push_back(waker.clone());
+          }
+          BorrowOrPendingWaker::PendingWaker(waker)
+        }
+      },
     }
   }
 
@@ -139,9 +207,23 @@ impl<T> AsyncRefCell<T> {
   }
 
   pub fn borrow_mut(&self) -> impl Future<Output = AsyncRefCellBorrowMut<T>> {
+    let maybe_borrow = self.try_borrow_mut();
     AcquireBorrowMutFuture {
       cell: self,
-      drop_flag: Default::default(),
+      borrow_or_pending_item: match maybe_borrow {
+        Some(borrow) => BorrowMutOrPendingWaker::Borrow(Some(borrow)),
+        None => {
+          let waker = Rc::new(UnsafeCell::new(PendingWaker {
+            kind: BorrowKind::Write,
+            waker: WakerState::Pending,
+            future_dropped: false,
+          }));
+          unsafe {
+            (*self.state.get()).pending.push_back(waker.clone());
+          }
+          BorrowMutOrPendingWaker::PendingWaker(waker)
+        }
+      },
     }
   }
 
@@ -164,15 +246,26 @@ impl<T> AsyncRefCell<T> {
   }
 }
 
+enum BorrowOrPendingWaker<'a, T> {
+  Borrow(Option<AsyncRefCellBorrow<'a, T>>),
+  PendingWaker(Rc<UnsafeCell<PendingWaker>>),
+}
+
 struct AcquireBorrowFuture<'a, T> {
   cell: &'a AsyncRefCell<T>,
-  drop_flag: Option<Rc<Flag>>,
+  borrow_or_pending_item: BorrowOrPendingWaker<'a, T>,
 }
 
 impl<'a, T> Drop for AcquireBorrowFuture<'a, T> {
   fn drop(&mut self) {
-    if let Some(flag) = &self.drop_flag {
-      flag.raise();
+    match &self.borrow_or_pending_item {
+      BorrowOrPendingWaker::Borrow(_) => {
+        // ignore, will be dropped
+      }
+      BorrowOrPendingWaker::PendingWaker(pending) => unsafe {
+        let pending = &mut *pending.get();
+        pending.future_dropped = true;
+      },
     }
   }
 }
@@ -184,34 +277,50 @@ impl<'a, T> Future for AcquireBorrowFuture<'a, T> {
     mut self: Pin<&mut Self>,
     cx: &mut Context<'_>,
   ) -> Poll<Self::Output> {
-    unsafe {
-      let state = &mut *self.cell.state.get();
-
-      if state.try_acquire(BorrowKind::Read) {
-        Poll::Ready(self.cell.create_borrow())
-      } else {
-        let future_dropped =
-          self.drop_flag.get_or_insert(Default::default()).clone();
-        state.pending.push_back(PendingWaker {
-          kind: BorrowKind::Read,
-          waker: cx.waker().clone(),
-          future_dropped,
-        });
-        Poll::Pending
+    match &mut self.borrow_or_pending_item {
+      BorrowOrPendingWaker::Borrow(borrow) => {
+        Poll::Ready(borrow.take().unwrap())
       }
+      BorrowOrPendingWaker::PendingWaker(waker) => unsafe {
+        let waker = &mut *waker.get();
+        match &waker.waker {
+          WakerState::Pending | WakerState::Waiting(_) => {
+            waker.waker = WakerState::Waiting(Some(cx.waker().clone()));
+            Poll::Pending
+          }
+          WakerState::Ready(_) => {
+            waker.waker = WakerState::Complete;
+            Poll::Ready(self.cell.create_borrow())
+          }
+          WakerState::Complete => {
+            unreachable!();
+          }
+        }
+      },
     }
   }
 }
 
+enum BorrowMutOrPendingWaker<'a, T> {
+  Borrow(Option<AsyncRefCellBorrowMut<'a, T>>),
+  PendingWaker(Rc<UnsafeCell<PendingWaker>>),
+}
+
 struct AcquireBorrowMutFuture<'a, T> {
   cell: &'a AsyncRefCell<T>,
-  drop_flag: Option<Rc<Flag>>,
+  borrow_or_pending_item: BorrowMutOrPendingWaker<'a, T>,
 }
 
 impl<'a, T> Drop for AcquireBorrowMutFuture<'a, T> {
   fn drop(&mut self) {
-    if let Some(flag) = &self.drop_flag {
-      flag.raise();
+    match &mut self.borrow_or_pending_item {
+      BorrowMutOrPendingWaker::Borrow(_) => {
+        // ignore, will be dropped
+      }
+      BorrowMutOrPendingWaker::PendingWaker(pending) => unsafe {
+        let pending = &mut *pending.get();
+        pending.future_dropped = true;
+      },
     }
   }
 }
@@ -223,21 +332,26 @@ impl<'a, T> Future for AcquireBorrowMutFuture<'a, T> {
     mut self: Pin<&mut Self>,
     cx: &mut Context<'_>,
   ) -> Poll<Self::Output> {
-    unsafe {
-      let state = &mut *self.cell.state.get();
-
-      if state.try_acquire(BorrowKind::Write) {
-        Poll::Ready(self.cell.create_borrow_mut())
-      } else {
-        let future_dropped =
-          self.drop_flag.get_or_insert(Default::default()).clone();
-        state.pending.push_back(PendingWaker {
-          kind: BorrowKind::Write,
-          waker: cx.waker().clone(),
-          future_dropped,
-        });
-        Poll::Pending
+    match &mut self.borrow_or_pending_item {
+      BorrowMutOrPendingWaker::Borrow(borrow) => {
+        Poll::Ready(borrow.take().unwrap())
       }
+      BorrowMutOrPendingWaker::PendingWaker(waker) => unsafe {
+        let waker = &mut *waker.get();
+        match &waker.waker {
+          WakerState::Pending | WakerState::Waiting(_) => {
+            waker.waker = WakerState::Waiting(Some(cx.waker().clone()));
+            Poll::Pending
+          }
+          WakerState::Ready(_) => {
+            waker.waker = WakerState::Complete;
+            Poll::Ready(self.cell.create_borrow_mut())
+          }
+          WakerState::Complete => {
+            unreachable!();
+          }
+        }
+      },
     }
   }
 }
@@ -252,13 +366,7 @@ pub struct AsyncRefCellBorrow<'a, T> {
 impl<'a, T> Drop for AsyncRefCellBorrow<'a, T> {
   fn drop(&mut self) {
     unsafe {
-      let state = &mut *self.state.get();
-
-      state.reader_count -= 1;
-
-      if state.reader_count == 0 {
-        state.wake_pending();
-      }
+      (*self.state.get()).release(BorrowKind::Read, &self.state);
     }
   }
 }
@@ -281,10 +389,7 @@ pub struct AsyncRefCellBorrowMut<'a, T> {
 impl<'a, T> Drop for AsyncRefCellBorrowMut<'a, T> {
   fn drop(&mut self) {
     unsafe {
-      let state = &mut *self.state.get();
-
-      state.is_writing = false;
-      state.wake_pending();
+      (*self.state.get()).release(BorrowKind::Write, &self.state);
     }
   }
 }

@@ -6,7 +6,7 @@ use deno_unsync::other::AsyncRefCell as CoreAsyncRefCell;
 use criterion::async_executor::FuturesExecutor;
 
 fn criterion_benchmark(c: &mut Criterion) {
-  c.bench_function("new", |b| {
+  c.bench_function("new read", |b| {
     b.to_async(FuturesExecutor).iter(|| async move {
       let cell = AsyncRefCell::new(1);
       let mut borrows = Vec::with_capacity(10_000);
@@ -17,6 +17,11 @@ fn criterion_benchmark(c: &mut Criterion) {
         let borrow = borrow.await;
         assert_eq!(*borrow, 1);
       }
+    })
+  });
+  c.bench_function("new mut", |b| {
+    b.to_async(FuturesExecutor).iter(|| async move {
+      let cell = AsyncRefCell::new(1);
       let mut borrows = Vec::with_capacity(10_000);
       for _ in 0..borrows.capacity() {
         borrows.push(cell.borrow_mut());
@@ -29,7 +34,7 @@ fn criterion_benchmark(c: &mut Criterion) {
     })
   });
 
-  c.bench_function("core", |b| {
+  c.bench_function("core read", |b| {
     b.to_async(FuturesExecutor).iter(|| async move {
       let cell = Rc::new(CoreAsyncRefCell::new(1));
       let mut borrows = Vec::with_capacity(10_000);
@@ -40,6 +45,11 @@ fn criterion_benchmark(c: &mut Criterion) {
         let borrow = borrow.await;
         assert_eq!(*borrow, 1);
       }
+    })
+  });
+  c.bench_function("core mut", |b| {
+    b.to_async(FuturesExecutor).iter(|| async move {
+      let cell = Rc::new(CoreAsyncRefCell::new(1));
       let mut borrows = Vec::with_capacity(10_000);
       for _ in 0..borrows.capacity() {
         borrows.push(cell.borrow_mut());

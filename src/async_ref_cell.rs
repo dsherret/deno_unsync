@@ -108,22 +108,19 @@ impl State {
         if !pending.future_dropped {
           if pending.kind.is_read() || !found_pending {
             match &mut pending.waker {
-              WakerState::Complete => {
-                // ignore
-              }
               WakerState::Pending => {
                 self.acquire(pending.kind);
                 pending.waker = WakerState::Ready(state.clone());
                 found_pending = true;
-              }
-              WakerState::Ready(_) => {
-                unreachable!();
               }
               WakerState::Waiting(waker) => {
                 self.acquire(pending.kind);
                 waker.take().unwrap().wake();
                 pending.waker = WakerState::Ready(state.clone());
                 found_pending = true;
+              }
+              WakerState::Ready(_) | WakerState::Complete => {
+                unreachable!();
               }
             }
             if pending.kind.is_write() && found_pending {
@@ -200,9 +197,8 @@ impl<T> AsyncRefCell<T> {
 
   fn create_borrow(&self) -> AsyncRefCellBorrow<T> {
     AsyncRefCellBorrow {
-      state: self.state.clone(),
+      cell: self,
       value: self.inner.get(),
-      _phantom: PhantomData::default(),
     }
   }
 
@@ -239,9 +235,8 @@ impl<T> AsyncRefCell<T> {
 
   fn create_borrow_mut(&self) -> AsyncRefCellBorrowMut<T> {
     AsyncRefCellBorrowMut {
-      state: self.state.clone(),
+      cell: self,
       value: self.inner.get(),
-      _phantom: PhantomData::default(),
     }
   }
 }
@@ -358,15 +353,14 @@ impl<'a, T> Future for AcquireBorrowMutFuture<'a, T> {
 
 #[derive(Debug)]
 pub struct AsyncRefCellBorrow<'a, T> {
-  state: Rc<UnsafeCell<State>>,
+  cell: &'a AsyncRefCell<T>,
   value: *const T,
-  _phantom: PhantomData<&'a T>,
 }
 
 impl<'a, T> Drop for AsyncRefCellBorrow<'a, T> {
   fn drop(&mut self) {
     unsafe {
-      (*self.state.get()).release(BorrowKind::Read, &self.state);
+      (*self.cell.state.get()).release(BorrowKind::Read, &self.cell.state);
     }
   }
 }
@@ -381,15 +375,14 @@ impl<'a, T> Deref for AsyncRefCellBorrow<'a, T> {
 
 #[derive(Debug)]
 pub struct AsyncRefCellBorrowMut<'a, T> {
-  state: Rc<UnsafeCell<State>>,
+  cell: &'a AsyncRefCell<T>,
   value: *mut T,
-  _phantom: PhantomData<&'a T>,
 }
 
 impl<'a, T> Drop for AsyncRefCellBorrowMut<'a, T> {
   fn drop(&mut self) {
     unsafe {
-      (*self.state.get()).release(BorrowKind::Write, &self.state);
+      (*self.cell.state.get()).release(BorrowKind::Write, &self.cell.state);
     }
   }
 }

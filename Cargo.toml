@@ -11,5 +11,12 @@ readme = "README.md"
 [dependencies]
 tokio = { version = "1", features = ["macros", "rt"] }
 
+[dev-dependencies]
+criterion = { version ="0.5.1", features = ["async_futures"] }
+
 [lib]
 name = "deno_unsync"
+
+[[bench]]
+name = "my_benchmark"
+harness = false

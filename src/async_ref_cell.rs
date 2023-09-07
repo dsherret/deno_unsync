@@ -125,7 +125,7 @@ impl Future for AcquireFuture {
 
   fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
     unsafe {
-      let mut state = &mut *self.state.get();
+      let state = &mut *self.state.get();
 
       if state.is_writing
         || self.is_reader && !state.pending.is_empty()
@@ -160,7 +160,7 @@ pub struct AsyncRefCellBorrow<'a, T> {
 impl<'a, T> Drop for AsyncRefCellBorrow<'a, T> {
   fn drop(&mut self) {
     unsafe {
-      let mut state = &mut *self.state.get();
+      let state = &mut *self.state.get();
 
       state.reader_count -= 1;
 
@@ -189,7 +189,7 @@ pub struct AsyncRefCellBorrowMut<'a, T> {
 impl<'a, T> Drop for AsyncRefCellBorrowMut<'a, T> {
   fn drop(&mut self) {
     unsafe {
-      let mut state = &mut *self.state.get();
+      let state = &mut *self.state.get();
 
       state.is_writing = false;
       state.wake_pending();

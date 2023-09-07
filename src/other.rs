@@ -121,26 +121,6 @@ impl<T> RcRef<AsyncRefCell<T>> {
 /// it dereferences to any value that's reachable through the reference-counted
 /// pointer. This is achieved through the associated method, `RcRef::map()`,
 /// similar to how `std::cell::Ref::map()` works. Example:
-///
-/// ```rust
-/// # use std::rc::Rc;
-/// # use deno_core::RcRef;
-///
-/// struct Stuff {
-///   foo: u32,
-///   bar: String,
-/// }
-///
-/// let stuff_rc = Rc::new(Stuff {
-///   foo: 42,
-///   bar: "hello".to_owned(),
-/// });
-///
-/// // `foo_rc` and `bar_rc` dereference to different types, however
-/// // they share a reference count.
-/// let foo_rc: RcRef<u32> = RcRef::map(stuff_rc.clone(), |v| &v.foo);
-/// let bar_rc: RcRef<String> = RcRef::map(stuff_rc, |v| &v.bar);
-/// ```
 #[derive(Debug)]
 pub struct RcRef<T> {
   rc: Rc<dyn Any>,
@@ -243,18 +223,18 @@ mod internal {
   use super::AsyncRefCell;
   use super::RcLike;
   use super::RcRef;
-  use std::future::Future;
-  use std::task::ready;
-  use std::task::Context;
-  use std::task::Poll;
-  use std::task::Waker;
   use std::borrow::Borrow;
   use std::borrow::BorrowMut;
   use std::fmt::Debug;
+  use std::future::Future;
   use std::marker::PhantomData;
   use std::ops::Deref;
   use std::ops::DerefMut;
   use std::pin::Pin;
+  use std::task::ready;
+  use std::task::Context;
+  use std::task::Poll;
+  use std::task::Waker;
 
   impl<T> AsyncRefCell<T> {
     /// Borrow the cell's contents synchronously without creating an

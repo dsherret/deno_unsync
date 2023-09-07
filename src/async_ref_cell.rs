@@ -29,7 +29,7 @@ impl BorrowKind {
 enum WakerState {
   Pending,
   Waiting(Option<Waker>),
-  Ready(Rc<UnsafeCell<State>>),
+  Ready,
   Complete,
 }
 
@@ -38,17 +38,6 @@ struct PendingWaker {
   kind: BorrowKind,
   waker: WakerState,
   future_dropped: bool,
-}
-
-impl Drop for PendingWaker {
-  fn drop(&mut self) {
-    if let WakerState::Ready(state) = &self.waker {
-      // the future never got woken up, so release the acquired borrow
-      unsafe {
-        (*state.get()).release(self.kind, &state);
-      }
-    }
-  }
 }
 
 #[derive(Debug, Default)]
@@ -84,20 +73,20 @@ impl State {
     }
   }
 
-  pub fn release(&mut self, kind: BorrowKind, state: &Rc<UnsafeCell<State>>) {
+  pub fn release(&mut self, kind: BorrowKind) {
     if kind.is_read() {
       self.reader_count -= 1;
 
       if self.reader_count == 0 {
-        self.wake_pending(state);
+        self.wake_pending();
       }
     } else {
       self.is_writing = false;
-      self.wake_pending(state);
+      self.wake_pending();
     }
   }
 
-  fn wake_pending(&mut self, state: &Rc<UnsafeCell<State>>) {
+  fn wake_pending(&mut self) {
     let mut found_pending = false;
     while let Some(pending_cell) = self.pending.pop_front() {
       unsafe {
@@ -107,17 +96,17 @@ impl State {
             match &mut pending.waker {
               WakerState::Pending => {
                 self.acquire(pending.kind);
-                pending.waker = WakerState::Ready(state.clone());
+                pending.waker = WakerState::Ready;
                 found_pending = true;
               }
               WakerState::Waiting(waker) => {
                 self.acquire(pending.kind);
                 let waker = waker.take().unwrap();
-                pending.waker = WakerState::Ready(state.clone());
+                pending.waker = WakerState::Ready;
                 found_pending = true;
                 waker.wake();
               }
-              WakerState::Ready(_) | WakerState::Complete => {
+              WakerState::Ready | WakerState::Complete => {
                 unreachable!();
               }
             }
@@ -258,6 +247,10 @@ impl<'a, T> Drop for AcquireBorrowFuture<'a, T> {
       BorrowOrPendingWaker::PendingWaker(pending) => unsafe {
         let pending = &mut *pending.get();
         pending.future_dropped = true;
+        if matches!(pending.waker, WakerState::Ready) {
+          // the future never got woken up, so release the acquired borrow
+          (*self.cell.state.get()).release(BorrowKind::Read);
+        }
       },
     }
   }
@@ -276,16 +269,23 @@ impl<'a, T> Future for AcquireBorrowFuture<'a, T> {
       }
       BorrowOrPendingWaker::PendingWaker(waker) => unsafe {
         let waker = &mut *waker.get();
+        // todo: make common with other AcquireBorrowMutFuture
         match &waker.waker {
-          WakerState::Pending | WakerState::Waiting(_) => {
+          WakerState::Pending => {
             waker.waker = WakerState::Waiting(Some(cx.waker().clone()));
             Poll::Pending
           }
-          WakerState::Ready(_) => {
+          WakerState::Waiting(Some(current_waker)) => {
+            if !current_waker.will_wake(cx.waker()) {
+              waker.waker = WakerState::Waiting(Some(cx.waker().clone()));
+            }
+            Poll::Pending
+          }
+          WakerState::Ready => {
             waker.waker = WakerState::Complete;
             Poll::Ready(self.cell.create_borrow())
           }
-          WakerState::Complete => {
+          WakerState::Complete | WakerState::Waiting(None) => {
             unreachable!();
           }
         }
@@ -313,6 +313,10 @@ impl<'a, T> Drop for AcquireBorrowMutFuture<'a, T> {
       BorrowMutOrPendingWaker::PendingWaker(pending) => unsafe {
         let pending = &mut *pending.get();
         pending.future_dropped = true;
+        if matches!(pending.waker, WakerState::Ready) {
+          // the future never got woken up, so release the acquired borrow
+          (*self.cell.state.get()).release(BorrowKind::Write);
+        }
       },
     }
   }
@@ -332,15 +336,21 @@ impl<'a, T> Future for AcquireBorrowMutFuture<'a, T> {
       BorrowMutOrPendingWaker::PendingWaker(waker) => unsafe {
         let waker = &mut *waker.get();
         match &waker.waker {
-          WakerState::Pending | WakerState::Waiting(_) => {
+          WakerState::Pending => {
             waker.waker = WakerState::Waiting(Some(cx.waker().clone()));
             Poll::Pending
           }
-          WakerState::Ready(_) => {
+          WakerState::Waiting(Some(current_waker)) => {
+            if !current_waker.will_wake(cx.waker()) {
+              waker.waker = WakerState::Waiting(Some(cx.waker().clone()));
+            }
+            Poll::Pending
+          }
+          WakerState::Ready => {
             waker.waker = WakerState::Complete;
             Poll::Ready(self.cell.create_borrow_mut())
           }
-          WakerState::Complete => {
+          WakerState::Complete | WakerState::Waiting(None) => {
             unreachable!();
           }
         }
@@ -358,7 +368,7 @@ pub struct AsyncRefCellBorrow<'a, T> {
 impl<'a, T> Drop for AsyncRefCellBorrow<'a, T> {
   fn drop(&mut self) {
     unsafe {
-      (*self.cell.state.get()).release(BorrowKind::Read, &self.cell.state);
+      (*self.cell.state.get()).release(BorrowKind::Read);
     }
   }
 }
@@ -380,7 +390,7 @@ pub struct AsyncRefCellBorrowMut<'a, T> {
 impl<'a, T> Drop for AsyncRefCellBorrowMut<'a, T> {
   fn drop(&mut self) {
     unsafe {
-      (*self.cell.state.get()).release(BorrowKind::Write, &self.cell.state);
+      (*self.cell.state.get()).release(BorrowKind::Write);
     }
   }
 }

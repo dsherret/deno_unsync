@@ -52,6 +52,21 @@ fn criterion_benchmark(c: &mut Criterion) {
       }
     })
   });
+  c.bench_function("new write, many reads", |b| {
+    b.to_async(FuturesExecutor).iter(|| async move {
+      let cell = AsyncRefCell::new(1);
+      let write = cell.borrow_mut();
+      let mut borrows = Vec::with_capacity(10_000);
+      for _ in 0..borrows.capacity() {
+        borrows.push(cell.borrow());
+      }
+      write.await; // release
+      for borrow in borrows {
+        let borrow = borrow.await;
+        assert_eq!(*borrow, 1);
+      }
+    })
+  });
 
   c.bench_function("core read sequential", |b| {
     b.to_async(FuturesExecutor).iter(|| async move {
@@ -96,6 +111,21 @@ fn criterion_benchmark(c: &mut Criterion) {
         let mut borrow = borrow.await;
         *borrow = 2;
         assert_eq!(*borrow, 2);
+      }
+    })
+  });
+  c.bench_function("core write, many reads", |b| {
+    b.to_async(FuturesExecutor).iter(|| async move {
+      let cell = Rc::new(CoreAsyncRefCell::new(1));
+      let write = cell.borrow_mut();
+      let mut borrows = Vec::with_capacity(10_000);
+      for _ in 0..borrows.capacity() {
+        borrows.push(cell.borrow());
+      }
+      write.await; // release
+      for borrow in borrows {
+        let borrow = borrow.await;
+        assert_eq!(*borrow, 1);
       }
     })
   });
